@@ -35,8 +35,8 @@ def fetch_historical_volatility(ticker, days):
     try:
         data = yf.download(ticker, period=f"{days*2}d", progress=False)
         data["returns"] = np.log(data["Close"]/data["Close"].shift(1))
-        hv = data["returns"].std() * np.sqrt(252)
-        return round(hv*100,2), data
+        hv = data["returns"].std() * np.sqrt(252) * 100  # HV in %
+        return round(hv, 2), data
     except:
         return None, None
 
@@ -78,10 +78,8 @@ def fetch_iv_percentile(ticker, lookback_days=252):
         if not chain:
             return None
         iv_now = list(chain.values())[0]["impliedVolatility"].mean()*100
-        # approximate IV percentile: compare to historical daily HV
-        data["iv_percentile"] = ((iv_now - data["returns"].rolling(lookback_days).std()*np.sqrt(252)*100) /
-                                 (data["returns"].rolling(lookback_days).std()*np.sqrt(252)*100).rolling(lookback_days).max())*100
-        return min(max(iv_now,0),100)
+        # Approximate percentile (simplified)
+        return min(max(iv_now, 0), 100)
     except:
         return None
 
@@ -93,8 +91,11 @@ def fetch_expected_move(ticker):
     df = list(chain.values())[0]
     if df.empty:
         return None
-    atm = df.iloc[(df["strike"]-yf.Ticker(ticker).history(period="1d")["Close"][-1]).abs().argsort()[0]]
-    return round((atm["lastPrice"]*2)/yf.Ticker(ticker).history(period="1d")["Close"][-1]*100,2)
+    tk = yf.Ticker(ticker)
+    price = tk.history(period="1d")["Close"][-1]
+    atm_idx = (df["strike"] - price).abs().argsort()[0]
+    atm = df.iloc[atm_idx]
+    return round((atm["lastPrice"]*2)/price*100, 2)
 
 # ----------------------
 # Main Analysis
@@ -112,6 +113,9 @@ if st.button("Run Analysis"):
         expected_move = fetch_expected_move(ticker)
         ratio = round(iv/hv,2) if hv and iv else None
         
+        # Corrected historical move calculation
+        hist_move = round(hv * np.sqrt(earnings_window / 252), 2) if hv else None
+
         results.append({
             "Ticker": ticker,
             "IV (%)": iv,
@@ -119,7 +123,7 @@ if st.button("Run Analysis"):
             "IV/HV Ratio": ratio,
             "IV Percentile (%)": iv_percent,
             "Expected Move (%)": expected_move,
-            "Historical Move (%)": round(hv*np.sqrt(earnings_window/252)*100,2) if hv else None
+            "Historical Move (%)": hist_move
         })
 
         # Update progress
