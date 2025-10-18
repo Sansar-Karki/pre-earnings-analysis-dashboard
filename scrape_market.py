@@ -1,40 +1,40 @@
 import pandas as pd
 import yfinance as yf
 import time
+from tqdm import tqdm
+from pathlib import Path
 
 # ----------------------------
-# Step 1: Load Nasdaq FTP file directly
+# Step 1: Load Nasdaq file
 # ----------------------------
-url = "http://ftp.nasdaqtrader.com/symboldirectory/nasdaqlisted.txt"
+url = "/Users/sansarkarki/Downloads/nasdaqlisted.txt"  # your local file
 nasdaq_df = pd.read_csv(url, sep="|", dtype=str)
 
-# Remove the last row (contains "File Creation Time" summary)
-nasdaq_df = nasdaq_df[:-1]
-
-print(f"Total tickers loaded from Nasdaq FTP: {len(nasdaq_df)}")
+# Ensure 'Symbol' column is string
+nasdaq_df['Symbol'] = nasdaq_df['Symbol'].astype(str)
 
 # ----------------------------
 # Step 2: Filter common stocks
 # ----------------------------
-# Keep only:
-# - Market Category Q (Nasdaq Global Market) or S (Nasdaq SmallCap Market)
-# - ETF == 'N'
-# - Remove symbols ending with W, U, or R (warrants/units/rights)
 filtered_df = nasdaq_df[
     (nasdaq_df['Market Category'].isin(['Q','S'])) &
     (nasdaq_df['ETF'] == 'N') &
-    (~nasdaq_df['Symbol'].str.endswith(('W','U','R')))
+    (~nasdaq_df['Symbol'].fillna("").str.endswith(('W','U','R')))
 ].copy()
 
 print(f"Filtered tickers (common stocks only): {len(filtered_df)}")
 
 # ----------------------------
-# Step 3: Add Sector and Market Cap using yfinance
+# Step 3: Add Sector and Market Cap with progress bar
 # ----------------------------
 filtered_df["Sector"] = None
 filtered_df["MarketCap"] = None
 
-for i, row in filtered_df.iterrows():
+# Optional: save periodically in case of interruption
+save_interval = 50  # save every 50 tickers
+output_file = Path("nasdaq_largecap.csv")
+
+for i, row in tqdm(filtered_df.iterrows(), total=len(filtered_df), desc="Fetching yfinance data"):
     ticker = row["Symbol"]
     try:
         tk = yf.Ticker(ticker)
@@ -44,18 +44,26 @@ for i, row in filtered_df.iterrows():
     except Exception as e:
         print(f"Error fetching {ticker}: {e}")
         continue
-    time.sleep(0.5)  # avoid throttling Yahoo Finance
+
+    time.sleep(0.5)  # prevent throttling
+
+    # Periodically save
+    if i % save_interval == 0 and i != 0:
+        filtered_df.to_csv(output_file, index=False)
+        print(f"Intermediate save at ticker {i}")
 
 # ----------------------------
 # Step 4: Filter large-cap companies (MarketCap > 10B)
 # ----------------------------
-largecap_df = filtered_df[filtered_df["MarketCap"].astype(float) > 10e9].copy()
+# Some MarketCap might be None, so convert safely
+filtered_df["MarketCap"] = pd.to_numeric(filtered_df["MarketCap"], errors="coerce")
+largecap_df = filtered_df[filtered_df["MarketCap"] > 10e9].copy()
 largecap_df.reset_index(drop=True, inplace=True)
 print(f"Large-cap tickers (>10B): {len(largecap_df)}")
 
 # ----------------------------
-# Step 5: Save to CSV
+# Step 5: Save final CSV
 # ----------------------------
-largecap_df.to_csv("nasdaq_largecap.csv", index=False)
-print("CSV saved: nasdaq_largecap.csv")
+largecap_df.to_csv(output_file, index=False)
+print(f"CSV saved: {output_file}")
 print(largecap_df.head())
