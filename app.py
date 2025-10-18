@@ -3,45 +3,67 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from datetime import datetime, timedelta
 
-# ----------------------
-# Page Setup
-# ----------------------
-st.set_page_config(page_title="Earnings IV/HV Analyzer", layout="wide")
-st.title("📊 Earnings IV/HV Analyzer")
+# -------------------------------
+# App setup
+# -------------------------------
+
+st.set_page_config(page_title="Earnings Edge: IV/HV Analyzer", layout="wide")
+st.title("📊 Earnings Edge: IV/HV Analyzer")
+
 st.markdown("""
-Analyze upcoming earnings using **IV/HV**, **IV percentile**, and **expected vs historical move**.
+Analyze implied vs historical volatility for upcoming earnings plays.  
+This version uses ATM IV filtering for accuracy.
 """)
 
-# ----------------------
-# Sidebar Inputs
-# ----------------------
+# -------------------------------
+# Sidebar
+# -------------------------------
+
 st.sidebar.header("Settings")
-tickers_input = st.sidebar.text_area(
-    "Enter tickers (comma-separated)",
-    "AAPL,MSFT,TSLA,NVDA,AMZN"
-)
+tickers_input = st.sidebar.text_area("Enter tickers (comma-separated)", "AAPL,MSFT,TSLA,NVDA,AMZN")
 hv_lookback = st.sidebar.slider("HV Lookback Period (days)", 10, 90, 30)
 show_iv_curve = st.sidebar.checkbox("Show IV Curve for Tickers", value=True)
-earnings_window = st.sidebar.slider("Days around earnings to estimate move", 1, 5, 1)
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
-# ----------------------
-# Helper Functions
-# ----------------------
-@st.cache_data
-def fetch_historical_volatility(ticker, days):
-    try:
-        data = yf.download(ticker, period=f"{days*2}d", progress=False)
-        data["returns"] = np.log(data["Close"]/data["Close"].shift(1))
-        hv = data["returns"].std() * np.sqrt(252) * 100  # HV in %
-        return round(hv, 2), data
-    except:
-        return None, None
+# -------------------------------
+# Load largecap CSV (from scraper)
+# -------------------------------
 
 @st.cache_data
-def fetch_iv_chain(ticker, expirations=2):
+def load_largecap():
+    try:
+        df = pd.read_csv("nasdaq_largecap.csv")  # From your scrape_market.py
+        df["MarketCap"] = pd.to_numeric(df["MarketCap"], errors="coerce")
+        return df
+    except FileNotFoundError:
+        st.warning("nasdaq_largecap.csv not found. Please run scrape_market.py first.")
+        return pd.DataFrame(columns=["Symbol", "Sector", "MarketCap"])
+
+largecap_df = load_largecap()
+
+# -------------------------------
+# Helper functions
+# -------------------------------
+
+@st.cache_data
+def fetch_historical_volatility(ticker, days):
+    """Calculate annualized historical volatility based on lookback period."""
+    try:
+        data = yf.download(ticker, period=f"{days}d", progress=False)
+        data["returns"] = np.log(data["Close"] / data["Close"].shift(1))
+        hv = data["returns"].std() * np.sqrt(252)
+        return round(hv * 100, 2)
+    except Exception as e:
+        print(f"Error fetching HV for {ticker}: {e}")
+        return None
+
+
+@st.cache_data
+def fetch_iv_chain(ticker, expirations=1):
+    """Fetch options chain data for given expirations."""
     try:
         tk = yf.Ticker(ticker)
         exp_dates = tk.options[:expirations]
@@ -54,99 +76,85 @@ def fetch_iv_chain(ticker, expirations=2):
             opt.puts["Expiration"] = exp
             chains[exp] = pd.concat([opt.calls, opt.puts], ignore_index=True)
         return chains
-    except:
-        return {}
+    except Exception as e:
+        print(f"Error fetching chain for {ticker}: {e}")
+        return None
+
 
 @st.cache_data
 def fetch_iv_avg(ticker):
-    chain = fetch_iv_chain(ticker, expirations=1)
-    if not chain:
-        return None
-    df = list(chain.values())[0]
-    if df.empty:
-        return None
-    return round(df["impliedVolatility"].mean()*100,2)
-
-@st.cache_data
-def fetch_iv_percentile(ticker, lookback_days=252):
-    _, data = fetch_historical_volatility(ticker, lookback_days)
-    if data is None:
-        return None
-    tk = yf.Ticker(ticker)
+    """Calculate average ATM implied volatility (±5% from spot)."""
     try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="1d")
+        if hist.empty:
+            return None
+        price = hist["Close"][-1]
+
         chain = fetch_iv_chain(ticker, expirations=1)
         if not chain:
             return None
-        iv_now = list(chain.values())[0]["impliedVolatility"].mean()*100
-        # Approximate percentile (simplified)
-        return min(max(iv_now, 0), 100)
-    except:
+
+        df = list(chain.values())[0]
+        if df.empty:
+            return None
+
+        # Filter near ATM (±5%)
+        df = df[(df["strike"] >= price * 0.95) & (df["strike"] <= price * 1.05)]
+        df = df[df["impliedVolatility"].notnull()]
+        if df.empty:
+            return None
+
+        iv = df["impliedVolatility"].mean() * 100
+        return round(iv, 2)
+    except Exception as e:
+        print(f"Error fetching IV for {ticker}: {e}")
         return None
 
-@st.cache_data
-def fetch_expected_move(ticker):
-    chain = fetch_iv_chain(ticker, expirations=1)
-    if not chain:
-        return None
-    df = list(chain.values())[0]
-    if df.empty:
-        return None
-    tk = yf.Ticker(ticker)
-    price = tk.history(period="1d")["Close"][-1]
-    atm_idx = (df["strike"] - price).abs().argsort()[0]
-    atm = df.iloc[atm_idx]
-    return round((atm["lastPrice"]*2)/price*100, 2)
+# -------------------------------
+# Main analysis
+# -------------------------------
 
-# ----------------------
-# Main Analysis
-# ----------------------
 results = []
 
 if st.button("Run Analysis"):
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    for idx, ticker in enumerate(tickers):
-        hv, hist_data = fetch_historical_volatility(ticker, hv_lookback)
-        iv = fetch_iv_avg(ticker)
-        iv_percent = fetch_iv_percentile(ticker)
-        expected_move = fetch_expected_move(ticker)
-        ratio = round(iv/hv,2) if hv and iv else None
-        
-        # Corrected historical move calculation
-        hist_move = round(hv * np.sqrt(earnings_window / 252), 2) if hv else None
+    with st.spinner("Fetching volatility data..."):
+        for ticker in tickers:
+            iv = fetch_iv_avg(ticker)
+            hv = fetch_historical_volatility(ticker, hv_lookback)
+            ratio = round(iv / hv, 2) if hv and iv else None
+            results.append({
+                "Ticker": ticker,
+                "IV (%)": iv,
+                "HV (%)": hv,
+                "IV/HV Ratio": ratio,
+            })
 
-        results.append({
-            "Ticker": ticker,
-            "IV (%)": iv,
-            "HV (%)": hv,
-            "IV/HV Ratio": ratio,
-            "IV Percentile (%)": iv_percent,
-            "Expected Move (%)": expected_move,
-            "Historical Move (%)": hist_move
-        })
-
-        # Update progress
-        progress_bar.progress((idx+1)/len(tickers))
-        progress_text.text(f"Processing {ticker} ({idx+1}/{len(tickers)})...")
-
-    df = pd.DataFrame(results)
-    df.sort_values("IV/HV Ratio", inplace=True)
+    df = pd.DataFrame(results).sort_values(by="IV/HV Ratio", ascending=True)
     st.success("✅ Analysis Complete!")
+
+    # Display results
     st.dataframe(df)
 
-    # CSV download
+    # Download CSV
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", csv, "iv_hv_analysis.csv", "text/csv")
 
-    # IV Curves
+    # Optional IV Curve plots
     if show_iv_curve:
         for ticker in tickers:
             chains = fetch_iv_chain(ticker)
+            if not chains:
+                continue
             for exp, df_chain in chains.items():
                 st.subheader(f"{ticker} IV Curve - Expiration {exp}")
-                fig = px.scatter(df_chain, x="strike", y="impliedVolatility", color="Type",
-                                 labels={"impliedVolatility":"IV","strike":"Strike"},
-                                 hover_data=["lastPrice","volume"])
+                fig = px.scatter(
+                    df_chain,
+                    x="strike",
+                    y="impliedVolatility",
+                    color="Type",
+                    labels={"impliedVolatility": "IV", "strike": "Strike"},
+                    hover_data=["lastPrice", "volume"]
+                )
                 fig.update_traces(marker=dict(size=8), mode='lines+markers')
                 st.plotly_chart(fig)
