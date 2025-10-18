@@ -3,26 +3,18 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from polygon import RESTClient
-from datetime import date, timedelta
-
-# ----------------------
-# Polygon API
-# ----------------------
-POLYGON_API_KEY = "pm85pW39kP0RVJaPt8fbhJJjujMOP2vE"
-client = RESTClient(POLYGON_API_KEY)
 
 # ----------------------
 # Page Setup
 # ----------------------
-st.set_page_config(page_title="Earnings IV/HV Dashboard", layout="wide")
-st.title("📊 Earnings IV/HV Dashboard")
+st.set_page_config(page_title="Earnings IV/HV Analyzer", layout="wide")
+st.title("📊 Earnings IV/HV Analyzer")
 st.markdown("""
-Analyze upcoming earnings using **IV/HV**, **IV curves**, and a simple **Earnings Calendar**.
+Analyze upcoming earnings using **IV/HV**, **IV percentile**, and **expected vs historical move**.
 """)
 
 # ----------------------
-# Sidebar
+# Sidebar Inputs
 # ----------------------
 st.sidebar.header("Settings")
 tickers_input = st.sidebar.text_area(
@@ -30,8 +22,8 @@ tickers_input = st.sidebar.text_area(
     "AAPL,MSFT,TSLA,NVDA,AMZN"
 )
 hv_lookback = st.sidebar.slider("HV Lookback Period (days)", 10, 90, 30)
-show_iv_curve = st.sidebar.checkbox("Show IV Curve", True)
-show_calendar = st.sidebar.checkbox("Show Earnings Calendar", True)
+show_iv_curve = st.sidebar.checkbox("Show IV Curve for Tickers", value=True)
+earnings_window = st.sidebar.slider("Days around earnings to estimate move", 1, 5, 1)
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
@@ -44,9 +36,9 @@ def fetch_historical_volatility(ticker, days):
         data = yf.download(ticker, period=f"{days*2}d", progress=False)
         data["returns"] = np.log(data["Close"]/data["Close"].shift(1))
         hv = data["returns"].std() * np.sqrt(252)
-        return round(hv*100,2)
+        return round(hv*100,2), data
     except:
-        return None
+        return None, None
 
 @st.cache_data
 def fetch_iv_chain(ticker, expirations=2):
@@ -75,23 +67,37 @@ def fetch_iv_avg(ticker):
         return None
     return round(df["impliedVolatility"].mean()*100,2)
 
-# ----------------------
-# Earnings Calendar
-# ----------------------
 @st.cache_data
-def fetch_next_earnings(ticker):
-    try:
-        today = date.today()
-        one_month = today + timedelta(days=30)
-        data = client.reference_earnings(ticker=ticker, from_=today.isoformat(), to=one_month.isoformat())
-        if data and "results" in data and len(data["results"])>0:
-            return pd.to_datetime(data["results"][0]["reporting_date"])
+def fetch_iv_percentile(ticker, lookback_days=252):
+    _, data = fetch_historical_volatility(ticker, lookback_days)
+    if data is None:
         return None
+    tk = yf.Ticker(ticker)
+    try:
+        chain = fetch_iv_chain(ticker, expirations=1)
+        if not chain:
+            return None
+        iv_now = list(chain.values())[0]["impliedVolatility"].mean()*100
+        # approximate IV percentile: compare to historical daily HV
+        data["iv_percentile"] = ((iv_now - data["returns"].rolling(lookback_days).std()*np.sqrt(252)*100) /
+                                 (data["returns"].rolling(lookback_days).std()*np.sqrt(252)*100).rolling(lookback_days).max())*100
+        return min(max(iv_now,0),100)
     except:
         return None
 
+@st.cache_data
+def fetch_expected_move(ticker):
+    chain = fetch_iv_chain(ticker, expirations=1)
+    if not chain:
+        return None
+    df = list(chain.values())[0]
+    if df.empty:
+        return None
+    atm = df.iloc[(df["strike"]-yf.Ticker(ticker).history(period="1d")["Close"][-1]).abs().argsort()[0]]
+    return round((atm["lastPrice"]*2)/yf.Ticker(ticker).history(period="1d")["Close"][-1]*100,2)
+
 # ----------------------
-# Run Analysis
+# Main Analysis
 # ----------------------
 results = []
 
@@ -100,17 +106,20 @@ if st.button("Run Analysis"):
     progress_bar = st.progress(0)
     
     for idx, ticker in enumerate(tickers):
-        hv = fetch_historical_volatility(ticker, hv_lookback)
+        hv, hist_data = fetch_historical_volatility(ticker, hv_lookback)
         iv = fetch_iv_avg(ticker)
+        iv_percent = fetch_iv_percentile(ticker)
+        expected_move = fetch_expected_move(ticker)
         ratio = round(iv/hv,2) if hv and iv else None
-        earnings_date = fetch_next_earnings(ticker)
-
+        
         results.append({
             "Ticker": ticker,
             "IV (%)": iv,
             "HV (%)": hv,
             "IV/HV Ratio": ratio,
-            "Next Earnings": earnings_date
+            "IV Percentile (%)": iv_percent,
+            "Expected Move (%)": expected_move,
+            "Historical Move (%)": round(hv*np.sqrt(earnings_window/252)*100,2) if hv else None
         })
 
         # Update progress
@@ -122,9 +131,9 @@ if st.button("Run Analysis"):
     st.success("✅ Analysis Complete!")
     st.dataframe(df)
 
-    # Download CSV
+    # CSV download
     csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, "iv_hv_earnings.csv", "text/csv")
+    st.download_button("Download CSV", csv, "iv_hv_analysis.csv", "text/csv")
 
     # IV Curves
     if show_iv_curve:
@@ -137,9 +146,3 @@ if st.button("Run Analysis"):
                                  hover_data=["lastPrice","volume"])
                 fig.update_traces(marker=dict(size=8), mode='lines+markers')
                 st.plotly_chart(fig)
-
-    # Earnings Calendar
-    if show_calendar:
-        st.subheader("📅 Upcoming Earnings Calendar")
-        calendar_df = df[["Ticker","Next Earnings"]].dropna().sort_values("Next Earnings")
-        st.dataframe(calendar_df)
