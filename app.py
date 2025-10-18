@@ -15,23 +15,30 @@ Analyze upcoming earnings using **IV/HV**, **IV curves**, **historical earnings 
 # --- Sidebar Inputs ---
 st.sidebar.header("Settings")
 tickers_input = st.sidebar.text_area(
-    "Enter tickers (comma-separated)",
-    "AAPL,MSFT,TSLA,NVDA,AMZN"
+    "Enter tickers (comma-separated) or leave blank to use large-cap Nasdaq CSV",
+    ""
 )
 hv_lookback = st.sidebar.slider("HV Lookback Period (days)", 10, 90, 30)
 peer_count = st.sidebar.slider("Max Sector Peers to Compare", 1, 10, 5)
 show_iv_curve = st.sidebar.checkbox("Show IV Curve for Tickers", value=True)
 
-tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-
-# --- Load S&P 500 CSV ---
+# --- Load Nasdaq Large-Cap CSV ---
 @st.cache_data
-def load_sp500():
-    df = pd.read_csv("sp500.csv")  # Columns: Ticker, Sector, MarketCap
+def load_largecap_csv():
+    df = pd.read_csv("nasdaq_largecap.csv")  # Columns: Symbol, Sector, MarketCap
+    df.rename(columns={"Symbol":"Ticker"}, inplace=True)
     df["MarketCap"] = pd.to_numeric(df["MarketCap"], errors="coerce")
     return df
 
-sp500_df = load_sp500()
+largecap_df = load_largecap_csv()
+
+# --- Determine tickers to analyze ---
+if tickers_input.strip():
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+else:
+    tickers = largecap_df["Ticker"].tolist()
+
+st.sidebar.markdown(f"✅ {len(tickers)} tickers loaded for analysis")
 
 # --- Helper Functions ---
 @st.cache_data
@@ -80,11 +87,11 @@ def fetch_earnings(ticker):
 
 @st.cache_data
 def fetch_sector_peers(ticker, max_peers=5):
-    sector = sp500_df.loc[sp500_df["Ticker"]==ticker,"Sector"].values
+    sector = largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values
     if len(sector)==0:
         return []
     sector = sector[0]
-    peers = sp500_df[(sp500_df["Sector"]==sector) & (sp500_df["Ticker"]!=ticker) & (sp500_df["MarketCap"]>10e9)]
+    peers = largecap_df[(largecap_df["Sector"]==sector) & (largecap_df["Ticker"]!=ticker)]
     peers = peers.sort_values("MarketCap", ascending=False).head(max_peers)
     return peers["Ticker"].tolist()
 
@@ -112,8 +119,11 @@ def historical_earnings_move(ticker, last_n=10, days_post=1):
 results = []
 
 if st.button("Run Analysis"):
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
     with st.spinner("Fetching data..."):
-        for ticker in tickers:
+        for idx, ticker in enumerate(tickers):
             iv = fetch_iv_avg(ticker)
             hv = fetch_historical_volatility(ticker, hv_lookback)
             earnings = fetch_earnings(ticker)
@@ -127,11 +137,18 @@ if st.button("Run Analysis"):
                 "HV (%)": hv,
                 "IV/HV Ratio": ratio,
                 "Historical Post-Earnings Move (%)": hist_move,
-                "Sector": sp500_df.loc[sp500_df["Ticker"]==ticker,"Sector"].values[0] if len(sp500_df.loc[sp500_df["Ticker"]==ticker])>0 else None,
+                "Sector": largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values[0] if len(largecap_df.loc[largecap_df["Ticker"]==ticker])>0 else None,
                 "Sector Peers": ", ".join(peers)
             })
-
+            # Update progress
+            progress_text.text(f"Processing {idx+1}/{len(tickers)}: {ticker}")
+            progress_bar.progress((idx+1)/len(tickers))
+    
+    # Convert results to DataFrame and sort by IV/HV ratio ascending
     df = pd.DataFrame(results)
+    df.sort_values("IV/HV Ratio", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    
     st.success("✅ Analysis Complete!")
     st.dataframe(df)
 
