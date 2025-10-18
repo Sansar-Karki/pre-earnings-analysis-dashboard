@@ -223,4 +223,32 @@ if st.button("Run Analysis"):
             "IV/HV Ratio": ratio,
             "Historical Post-Earnings Move (%)": hist_move,
             "Sector": sector_name,
-           
+            "Sector Avg Post-Earnings (%)": sector_avg,
+            "Peer Correlation": peer_corr,
+            "Sector Peers": ", ".join(peers)
+        })
+
+        # Update progress bar
+        progress_bar.progress((idx+1)/len(tickers))
+        progress_text.text(f"Processing {ticker} ({idx+1}/{len(tickers)})...")
+
+    df = pd.DataFrame(results)
+    df.sort_values("IV/HV Ratio", inplace=True)  # sort by lowest IV/HV
+    st.success("✅ Analysis Complete!")
+    st.dataframe(df)
+
+    # Download CSV
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV", csv, "earnings_analysis.csv", "text/csv")
+
+    # IV Curves
+    if show_iv_curve:
+        for ticker in tickers:
+            chains = fetch_iv_chain(ticker)
+            for exp, df_chain in chains.items():
+                st.subheader(f"{ticker} IV Curve - Expiration {exp}")
+                fig = px.scatter(df_chain, x="strike", y="impliedVolatility", color="Type",
+                                 labels={"impliedVolatility":"IV","strike":"Strike"},
+                                 hover_data=["lastPrice","volume"])
+                fig.update_traces(marker=dict(size=8), mode='lines+markers')
+                st.plotly_chart(fig)
