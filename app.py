@@ -1,22 +1,16 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-from polygon import RESTClient
-from datetime import timedelta, date
-
-# ----------------------
-# Polygon API Key
-# ----------------------
-POLYGON_API_KEY = "pm85pW39kP0RVJaPt8fbhJJjujMOP2vE"
-client = RESTClient(POLYGON_API_KEY)
+import plotly.express as px
 
 # ----------------------
 # Page Setup
 # ----------------------
-st.set_page_config(page_title="Earnings Edge Analyzer", layout="wide")
-st.title("📊 Earnings Edge: IV/HV & Sector Analysis (Polygon Data)")
+st.set_page_config(page_title="Earnings IV/HV Analyzer", layout="wide")
+st.title("📊 Earnings IV/HV Analyzer")
 st.markdown("""
-Analyze upcoming earnings using **IV/HV**, **historical earnings performance**, and **sector peer comparison**.
+Analyze upcoming earnings using **IV/HV** and **IV curves**.
 """)
 
 # ----------------------
@@ -24,141 +18,53 @@ Analyze upcoming earnings using **IV/HV**, **historical earnings performance**, 
 # ----------------------
 st.sidebar.header("Settings")
 tickers_input = st.sidebar.text_area(
-    "Enter tickers (comma-separated) or leave blank to use large-cap Nasdaq CSV",
-    ""
+    "Enter tickers (comma-separated)",
+    "AAPL,MSFT,TSLA,NVDA,AMZN"
 )
 hv_lookback = st.sidebar.slider("HV Lookback Period (days)", 10, 90, 30)
-peer_count = st.sidebar.slider("Max Sector Peers to Compare", 1, 10, 5)
+show_iv_curve = st.sidebar.checkbox("Show IV Curve for Tickers", value=True)
+
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 # ----------------------
-# Load Large-Cap Nasdaq CSV
+# Helper Functions
 # ----------------------
 @st.cache_data
-def load_largecap_csv():
-    df = pd.read_csv("nasdaq_largecap.csv")  # Columns: Symbol, Sector, MarketCap
-    df.rename(columns={"Symbol":"Ticker"}, inplace=True)
-    df["MarketCap"] = pd.to_numeric(df["MarketCap"], errors="coerce")
-    return df
-
-largecap_df = load_largecap_csv()
-
-# ----------------------
-# Determine tickers
-# ----------------------
-if tickers_input.strip():
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-else:
-    tickers = largecap_df["Ticker"].tolist()
-
-st.sidebar.markdown(f"✅ {len(tickers)} tickers loaded for analysis")
-
-# ----------------------
-# Polygon Helper Functions
-# ----------------------
-@st.cache_data
-def fetch_upcoming_earnings(ticker):
+def fetch_historical_volatility(ticker, days):
     try:
-        today = date.today()
-        one_month = today + timedelta(days=30)
-        data = client.reference_earnings(ticker=ticker, from_=today.isoformat(), to=one_month.isoformat())
-        if data and "results" in data and len(data["results"])>0:
-            return pd.to_datetime(data["results"][0]["reporting_date"])
-        return None
+        data = yf.download(ticker, period=f"{days*2}d", progress=False)
+        data["returns"] = np.log(data["Close"]/data["Close"].shift(1))
+        hv = data["returns"].std() * np.sqrt(252)
+        return round(hv*100,2)
     except:
         return None
 
 @st.cache_data
-def fetch_historical_earnings(ticker, last_n=10):
+def fetch_iv_chain(ticker, expirations=2):
     try:
-        data = client.reference_earnings(ticker=ticker, sort="desc", limit=last_n)
-        if data and "results" in data:
-            dates = [pd.to_datetime(item["reporting_date"]) for item in data["results"]]
-            return dates
-        return []
+        tk = yf.Ticker(ticker)
+        exp_dates = tk.options[:expirations]
+        chains = {}
+        for exp in exp_dates:
+            opt = tk.option_chain(exp)
+            opt.calls["Type"] = "Call"
+            opt.puts["Type"] = "Put"
+            opt.calls["Expiration"] = exp
+            opt.puts["Expiration"] = exp
+            chains[exp] = pd.concat([opt.calls, opt.puts], ignore_index=True)
+        return chains
     except:
-        return []
+        return {}
 
 @st.cache_data
-def fetch_historical_prices(ticker, start, end):
-    try:
-        bars = client.stocks_equities_aggregates(ticker, 1, "day", start.isoformat(), end.isoformat())
-        df = pd.DataFrame(bars['results'])
-        if df.empty:
-            return None
-        df['t'] = pd.to_datetime(df['t'], unit='ms')
-        df.set_index('t', inplace=True)
-        return df
-    except:
+def fetch_iv_avg(ticker):
+    chain = fetch_iv_chain(ticker, expirations=1)
+    if not chain:
         return None
-
-def post_earnings_move(ticker, earnings_dates, days_post=3):
-    moves = []
-    for date_item in earnings_dates:
-        pre_prices = fetch_historical_prices(ticker, date_item - timedelta(days=2), date_item)
-        post_prices = fetch_historical_prices(ticker, date_item, date_item + timedelta(days_post))
-        if pre_prices is None or post_prices is None or pre_prices.empty or post_prices.empty:
-            continue
-        move_pct = (post_prices['c'][-1] - pre_prices['c'][-1]) / pre_prices['c'][-1] * 100
-        moves.append(move_pct)
-    return round(np.mean(moves),2) if moves else None
-
-@st.cache_data
-def fetch_sector_peers(ticker, max_peers=10):
-    sector = largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values
-    if len(sector)==0:
-        return []
-    sector = sector[0]
-    peers = largecap_df[(largecap_df["Sector"]==sector) & (largecap_df["Ticker"]!=ticker)]
-    peers = peers.sort_values("MarketCap", ascending=False).head(max_peers)
-    return peers["Ticker"].tolist()
-
-@st.cache_data
-def sector_average_post_earnings(sector, last_n=10):
-    if sector is None:
+    df = list(chain.values())[0]
+    if df.empty:
         return None
-    peers = largecap_df[largecap_df["Sector"]==sector]["Ticker"].tolist()
-    moves = []
-    for t in peers:
-        dates = fetch_historical_earnings(t, last_n)
-        move = post_earnings_move(t, dates)
-        if move is not None:
-            moves.append(move)
-    return round(np.mean(moves),2) if moves else None
-
-@st.cache_data
-def peer_correlation(ticker, max_peers=10, last_n=10):
-    peers = fetch_sector_peers(ticker, max_peers)
-    if not peers:
-        return None
-    ticker_dates = fetch_historical_earnings(ticker, last_n)
-    if not ticker_dates:
-        return None
-
-    ticker_moves = []
-    peers_moves_avg = []
-
-    for date_item in ticker_dates:
-        ticker_prices_pre = fetch_historical_prices(ticker, date_item - timedelta(days=2), date_item)
-        ticker_prices_post = fetch_historical_prices(ticker, date_item, date_item + timedelta(days=3))
-        if ticker_prices_pre is None or ticker_prices_post is None:
-            continue
-        ticker_move = (ticker_prices_post['c'][-1] - ticker_prices_pre['c'][-1])/ticker_prices_pre['c'][-1]*100
-        ticker_moves.append(ticker_move)
-
-        peer_moves = []
-        for p in peers:
-            p_prices_pre = fetch_historical_prices(p, date_item - timedelta(days=2), date_item)
-            p_prices_post = fetch_historical_prices(p, date_item, date_item + timedelta(days=3))
-            if p_prices_pre is None or p_prices_post is None:
-                continue
-            move_p = (p_prices_post['c'][-1] - p_prices_pre['c'][-1])/p_prices_pre['c'][-1]*100
-            peer_moves.append(move_p)
-        if peer_moves:
-            peers_moves_avg.append(np.mean(peer_moves))
-
-    if ticker_moves and peers_moves_avg:
-        return round(np.corrcoef(ticker_moves, peers_moves_avg)[0,1],2)
-    return None
+    return round(df["impliedVolatility"].mean()*100,2)
 
 # ----------------------
 # Main Analysis
@@ -168,31 +74,39 @@ results = []
 if st.button("Run Analysis"):
     progress_text = st.empty()
     progress_bar = st.progress(0)
-
     for idx, ticker in enumerate(tickers):
-        upcoming_earnings = fetch_upcoming_earnings(ticker)
-        hist_dates = fetch_historical_earnings(ticker, last_n=10)
-        hist_move = post_earnings_move(ticker, hist_dates)
-        sector_name = largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values[0] if len(largecap_df.loc[largecap_df["Ticker"]==ticker])>0 else None
-        sector_avg = sector_average_post_earnings(sector_name, last_n=10)
-        peer_corr = peer_correlation(ticker, max_peers=peer_count, last_n=10)
-        peers = fetch_sector_peers(ticker, peer_count)
+        hv = fetch_historical_volatility(ticker, hv_lookback)
+        iv = fetch_iv_avg(ticker)
+        ratio = round(iv/hv,2) if hv and iv else None
 
         results.append({
             "Ticker": ticker,
-            "Upcoming Earnings": upcoming_earnings,
-            "Historical Post-Earnings Move (%)": hist_move,
-            "Sector": sector_name,
-            "Sector Avg Post-Earnings (%)": sector_avg,
-            "Peer Correlation": peer_corr,
-            "Sector Peers": ", ".join(peers)
+            "IV (%)": iv,
+            "HV (%)": hv,
+            "IV/HV Ratio": ratio
         })
 
+        # Update progress bar
         progress_bar.progress((idx+1)/len(tickers))
         progress_text.text(f"Processing {ticker} ({idx+1}/{len(tickers)})...")
 
     df = pd.DataFrame(results)
+    df.sort_values("IV/HV Ratio", inplace=True)  # sort by lowest IV/HV
     st.success("✅ Analysis Complete!")
     st.dataframe(df)
+
+    # CSV download
     csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, "earnings_analysis.csv", "text/csv")
+    st.download_button("Download CSV", csv, "iv_hv_analysis.csv", "text/csv")
+
+    # IV Curves
+    if show_iv_curve:
+        for ticker in tickers:
+            chains = fetch_iv_chain(ticker)
+            for exp, df_chain in chains.items():
+                st.subheader(f"{ticker} IV Curve - Expiration {exp}")
+                fig = px.scatter(df_chain, x="strike", y="impliedVolatility", color="Type",
+                                 labels={"impliedVolatility":"IV","strike":"Strike"},
+                                 hover_data=["lastPrice","volume"])
+                fig.update_traces(marker=dict(size=8), mode='lines+markers')
+                st.plotly_chart(fig)
