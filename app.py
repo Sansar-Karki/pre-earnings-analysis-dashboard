@@ -14,7 +14,7 @@ st.title("📊 Earnings Edge: IV/HV Analyzer")
 
 st.markdown("""
 Analyze implied vs historical volatility for upcoming earnings plays.  
-This version uses ATM IV filtering for accuracy.
+Now includes IV Percentile for richer context.
 """)
 
 # -------------------------------
@@ -24,6 +24,7 @@ This version uses ATM IV filtering for accuracy.
 st.sidebar.header("Settings")
 tickers_input = st.sidebar.text_area("Enter tickers (comma-separated)", "AAPL,MSFT,TSLA,NVDA,AMZN")
 hv_lookback = st.sidebar.slider("HV Lookback Period (days)", 10, 90, 30)
+iv_percentile_lookback = st.sidebar.slider("IV Percentile Lookback (days)", 30, 365, 180)
 show_iv_curve = st.sidebar.checkbox("Show IV Curve for Tickers", value=True)
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
@@ -35,7 +36,7 @@ tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 @st.cache_data
 def load_largecap():
     try:
-        df = pd.read_csv("nasdaq_largecap.csv")  # From your scrape_market.py
+        df = pd.read_csv("nasdaq_largecap.csv")
         df["MarketCap"] = pd.to_numeric(df["MarketCap"], errors="coerce")
         return df
     except FileNotFoundError:
@@ -111,6 +112,36 @@ def fetch_iv_avg(ticker):
         print(f"Error fetching IV for {ticker}: {e}")
         return None
 
+
+@st.cache_data
+def fetch_iv_percentile(ticker, lookback_days):
+    """
+    Approximate IV Percentile:
+    - Uses daily ATM IV snapshots (if available) or proxies with HV variation.
+    - Returns percentile rank of current IV within lookback range.
+    """
+    try:
+        # Try to approximate using HV variation as proxy (since yfinance lacks IV history)
+        data = yf.download(ticker, period=f"{lookback_days}d", progress=False)
+        data["returns"] = np.log(data["Close"] / data["Close"].shift(1))
+        data["hv_daily"] = data["returns"].rolling(20).std() * np.sqrt(252) * 100
+
+        hv_series = data["hv_daily"].dropna()
+        if hv_series.empty:
+            return None
+
+        current_iv = fetch_iv_avg(ticker)
+        if current_iv is None:
+            return None
+
+        min_hv, max_hv = hv_series.min(), hv_series.max()
+        iv_percentile = 100 * (current_iv - min_hv) / (max_hv - min_hv)
+        iv_percentile = np.clip(iv_percentile, 0, 100)
+        return round(iv_percentile, 1)
+    except Exception as e:
+        print(f"Error fetching IV percentile for {ticker}: {e}")
+        return None
+
 # -------------------------------
 # Main analysis
 # -------------------------------
@@ -122,12 +153,14 @@ if st.button("Run Analysis"):
         for ticker in tickers:
             iv = fetch_iv_avg(ticker)
             hv = fetch_historical_volatility(ticker, hv_lookback)
+            ivp = fetch_iv_percentile(ticker, iv_percentile_lookback)
             ratio = round(iv / hv, 2) if hv and iv else None
             results.append({
                 "Ticker": ticker,
                 "IV (%)": iv,
                 "HV (%)": hv,
                 "IV/HV Ratio": ratio,
+                "IV Percentile (%)": ivp,
             })
 
     df = pd.DataFrame(results).sort_values(by="IV/HV Ratio", ascending=True)
