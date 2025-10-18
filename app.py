@@ -3,18 +3,26 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from polygon import RESTClient
+from datetime import date, timedelta
+
+# ----------------------
+# Polygon API
+# ----------------------
+POLYGON_API_KEY = "pm85pW39kP0RVJaPt8fbhJJjujMOP2vE"
+client = RESTClient(POLYGON_API_KEY)
 
 # ----------------------
 # Page Setup
 # ----------------------
-st.set_page_config(page_title="Earnings IV/HV Analyzer", layout="wide")
-st.title("📊 Earnings IV/HV Analyzer")
+st.set_page_config(page_title="Earnings IV/HV Dashboard", layout="wide")
+st.title("📊 Earnings IV/HV Dashboard")
 st.markdown("""
-Analyze upcoming earnings using **IV/HV** and **IV curves**.
+Analyze upcoming earnings using **IV/HV**, **IV curves**, and a simple **Earnings Calendar**.
 """)
 
 # ----------------------
-# Sidebar Inputs
+# Sidebar
 # ----------------------
 st.sidebar.header("Settings")
 tickers_input = st.sidebar.text_area(
@@ -22,7 +30,8 @@ tickers_input = st.sidebar.text_area(
     "AAPL,MSFT,TSLA,NVDA,AMZN"
 )
 hv_lookback = st.sidebar.slider("HV Lookback Period (days)", 10, 90, 30)
-show_iv_curve = st.sidebar.checkbox("Show IV Curve for Tickers", value=True)
+show_iv_curve = st.sidebar.checkbox("Show IV Curve", True)
+show_calendar = st.sidebar.checkbox("Show Earnings Calendar", True)
 
 tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
@@ -67,37 +76,55 @@ def fetch_iv_avg(ticker):
     return round(df["impliedVolatility"].mean()*100,2)
 
 # ----------------------
-# Main Analysis
+# Earnings Calendar
+# ----------------------
+@st.cache_data
+def fetch_next_earnings(ticker):
+    try:
+        today = date.today()
+        one_month = today + timedelta(days=30)
+        data = client.reference_earnings(ticker=ticker, from_=today.isoformat(), to=one_month.isoformat())
+        if data and "results" in data and len(data["results"])>0:
+            return pd.to_datetime(data["results"][0]["reporting_date"])
+        return None
+    except:
+        return None
+
+# ----------------------
+# Run Analysis
 # ----------------------
 results = []
 
 if st.button("Run Analysis"):
     progress_text = st.empty()
     progress_bar = st.progress(0)
+    
     for idx, ticker in enumerate(tickers):
         hv = fetch_historical_volatility(ticker, hv_lookback)
         iv = fetch_iv_avg(ticker)
         ratio = round(iv/hv,2) if hv and iv else None
+        earnings_date = fetch_next_earnings(ticker)
 
         results.append({
             "Ticker": ticker,
             "IV (%)": iv,
             "HV (%)": hv,
-            "IV/HV Ratio": ratio
+            "IV/HV Ratio": ratio,
+            "Next Earnings": earnings_date
         })
 
-        # Update progress bar
+        # Update progress
         progress_bar.progress((idx+1)/len(tickers))
         progress_text.text(f"Processing {ticker} ({idx+1}/{len(tickers)})...")
 
     df = pd.DataFrame(results)
-    df.sort_values("IV/HV Ratio", inplace=True)  # sort by lowest IV/HV
+    df.sort_values("IV/HV Ratio", inplace=True)
     st.success("✅ Analysis Complete!")
     st.dataframe(df)
 
-    # CSV download
+    # Download CSV
     csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, "iv_hv_analysis.csv", "text/csv")
+    st.download_button("Download CSV", csv, "iv_hv_earnings.csv", "text/csv")
 
     # IV Curves
     if show_iv_curve:
@@ -110,3 +137,9 @@ if st.button("Run Analysis"):
                                  hover_data=["lastPrice","volume"])
                 fig.update_traces(marker=dict(size=8), mode='lines+markers')
                 st.plotly_chart(fig)
+
+    # Earnings Calendar
+    if show_calendar:
+        st.subheader("📅 Upcoming Earnings Calendar")
+        calendar_df = df[["Ticker","Next Earnings"]].dropna().sort_values("Next Earnings")
+        st.dataframe(calendar_df)
