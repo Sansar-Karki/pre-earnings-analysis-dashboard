@@ -1,9 +1,16 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import plotly.express as px
-from datetime import timedelta
+from polygon import RESTClient
+from datetime import timedelta, date
+
+# ----------------------
+# Polygon API Key
+# ----------------------
+POLYGON_API_KEY = "pm85pW39kP0RVJaPt8fbhJJjujMOP2vE"
+client = RESTClient(POLYGON_API_KEY)
 
 # ----------------------
 # Page Setup
@@ -88,40 +95,46 @@ def fetch_iv_avg(ticker):
         return None
     return round(df["impliedVolatility"].mean()*100,2)
 
+# ----------------------
+# Polygon Earnings Functions
+# ----------------------
 @st.cache_data
-def fetch_earnings(ticker):
+def fetch_upcoming_earnings(ticker):
     try:
-        tk = yf.Ticker(ticker)
-        cal = tk.get_calendar()
-        if cal is not None and not cal.empty:
-            date = cal.iloc[0,0]
-            if isinstance(date, (list, tuple)):
-                date = date[0]
-            return pd.to_datetime(date)
+        today = date.today()
+        one_month = today + timedelta(days=30)
+        data = client.reference_earnings(ticker=ticker, from_=today.isoformat(), to=one_month.isoformat())
+        if data and "results" in data and len(data["results"])>0:
+            return pd.to_datetime(data["results"][0]["reporting_date"])
         return None
-    except:
+    except Exception as e:
+        print(f"Error fetching upcoming earnings for {ticker}: {e}")
         return None
 
 @st.cache_data
-def historical_earnings_move(ticker, last_n=10, days_post=1):
+def fetch_historical_earnings(ticker, last_n=10):
     try:
-        tk = yf.Ticker(ticker)
-        earnings_df = tk.get_earnings_dates(limit=last_n)
-        if earnings_df is None or earnings_df.empty:
-            return None
-        moves = []
-        for date in earnings_df.index:
-            date = pd.to_datetime(date)
-            pre = tk.history(start=date - timedelta(days=1), end=date)
-            post = tk.history(start=date, end=date + timedelta(days_post))
-            if not pre.empty and not post.empty:
-                move_pct = (post["Close"][-1] - pre["Close"][-1])/pre["Close"][-1]*100
-                moves.append(move_pct)
-        if moves:
-            return round(np.mean(moves),2)
-        return None
-    except:
-        return None
+        data = client.reference_earnings(ticker=ticker, sort="desc", limit=last_n)
+        if data and "results" in data:
+            dates = [pd.to_datetime(item["reporting_date"]) for item in data["results"]]
+            return dates
+        return []
+    except Exception as e:
+        print(f"Error fetching historical earnings for {ticker}: {e}")
+        return []
+
+def post_earnings_move(ticker, earnings_dates, days_post=1):
+    tk = yf.Ticker(ticker)
+    moves = []
+    for date_item in earnings_dates:
+        pre = tk.history(start=date_item - timedelta(days=1), end=date_item)
+        post = tk.history(start=date_item, end=date_item + timedelta(days_post))
+        if not pre.empty and not post.empty:
+            move_pct = (post["Close"][-1] - pre["Close"][-1])/pre["Close"][-1]*100
+            moves.append(move_pct)
+    if moves:
+        return round(np.mean(moves),2)
+    return None
 
 @st.cache_data
 def fetch_sector_peers(ticker, max_peers=10):
@@ -140,7 +153,8 @@ def sector_average_post_earnings(sector, last_n=10):
     peers = largecap_df[largecap_df["Sector"]==sector]["Ticker"].tolist()
     moves = []
     for t in peers:
-        move = historical_earnings_move(t, last_n=last_n)
+        dates = fetch_historical_earnings(t, last_n)
+        move = post_earnings_move(t, dates)
         if move is not None:
             moves.append(move)
     if moves:
@@ -153,27 +167,22 @@ def peer_correlation(ticker, max_peers=10, last_n=10):
     if not peers:
         return None
     tk = yf.Ticker(ticker)
-    try:
-        earnings_df = tk.get_earnings_dates(limit=last_n)
-        if earnings_df is None or earnings_df.empty:
-            return None
-    except:
+    earnings_dates = fetch_historical_earnings(ticker, last_n)
+    if not earnings_dates:
         return None
 
     ticker_moves = []
     peers_moves_avg = []
 
-    for date in earnings_df.index:
-        date = pd.to_datetime(date)
-        pre = tk.history(start=date - timedelta(days=1), end=date)
-        post = tk.history(start=date, end=date + timedelta(days=1))
+    for date_item in earnings_dates:
+        pre = tk.history(start=date_item - timedelta(days=1), end=date_item)
+        post = tk.history(start=date_item, end=date_item + timedelta(days=1))
         if pre.empty or post.empty:
             continue
         ticker_move = (post["Close"][-1] - pre["Close"][-1])/pre["Close"][-1]*100
         ticker_moves.append(ticker_move)
 
-        # batch fetch peers
-        peers_data = yf.download(peers, start=date - timedelta(days=1), end=date + timedelta(days=1), progress=False)
+        peers_data = yf.download(peers, start=date_item - timedelta(days=1), end=date_item + timedelta(days=1), progress=False)
         peer_moves = []
         for p in peers:
             if (p, "Close") in peers_data.columns:
@@ -197,64 +206,21 @@ if st.button("Run Analysis"):
     for idx, ticker in enumerate(tickers):
         iv = fetch_iv_avg(ticker)
         hv = fetch_historical_volatility(ticker, hv_lookback)
-        earnings = fetch_earnings(ticker)
-        peers = fetch_sector_peers(ticker, peer_count)
-        hist_move = historical_earnings_move(ticker, last_n=10)
-        ratio = round(iv/hv,2) if hv and iv else None
+        earnings_upcoming = fetch_upcoming_earnings(ticker)
+        hist_dates = fetch_historical_earnings(ticker, last_n=10)
+        hist_move = post_earnings_move(ticker, hist_dates)
+        ratio = round(iv/hv,2) if iv and hv else None
         sector_name = largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values[0] if len(largecap_df.loc[largecap_df["Ticker"]==ticker])>0 else None
         sector_avg = sector_average_post_earnings(sector_name, last_n=10)
         peer_corr = peer_correlation(ticker, max_peers=peer_count, last_n=10)
+        peers = fetch_sector_peers(ticker, peer_count)
 
         results.append({
             "Ticker": ticker,
-            "Earnings": earnings,
+            "Upcoming Earnings": earnings_upcoming,
             "IV (%)": iv,
             "HV (%)": hv,
             "IV/HV Ratio": ratio,
             "Historical Post-Earnings Move (%)": hist_move,
             "Sector": sector_name,
-            "Sector Avg Post-Earnings Move (%)": sector_avg,
-            "Peer Correlation": peer_corr,
-            "Sector Peers": ", ".join(peers)
-        })
-
-        progress_text.text(f"Processing {idx+1}/{len(tickers)}: {ticker}")
-        progress_bar.progress((idx+1)/len(tickers))
-
-    df = pd.DataFrame(results)
-    df.sort_values("IV/HV Ratio", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    st.success("✅ Analysis Complete!")
-    st.dataframe(df)
-
-    # CSV download
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, "earnings_analysis.csv", "text/csv")
-
-    # Sector performance chart
-    st.subheader("📈 Sector Average Post-Earnings Move")
-    sector_df = df[["Ticker","Sector","Sector Avg Post-Earnings Move (%)"]].drop_duplicates()
-    fig_sector = px.bar(sector_df, x="Ticker", y="Sector Avg Post-Earnings Move (%)",
-                        color="Sector", labels={"Sector Avg Post-Earnings Move (%)":"Avg Post-Earnings Move (%)"})
-    st.plotly_chart(fig_sector)
-
-    # Peer correlation chart
-    st.subheader("🔗 Correlation to Sector Peers Post-Earnings")
-    corr_df = df[["Ticker","Peer Correlation"]].dropna()
-    fig_corr = px.bar(corr_df, x="Ticker", y="Peer Correlation",
-                      color="Peer Correlation", color_continuous_scale="Viridis",
-                      labels={"Peer Correlation":"Correlation"})
-    st.plotly_chart(fig_corr)
-
-    # IV curves
-    if show_iv_curve:
-        for ticker in tickers:
-            chains = fetch_iv_chain(ticker)
-            for exp, df_chain in chains.items():
-                st.subheader(f"{ticker} IV Curve - Expiration {exp}")
-                fig = px.scatter(df_chain, x="strike", y="impliedVolatility", color="Type",
-                                 labels={"impliedVolatility":"IV","strike":"Strike"},
-                                 hover_data=["lastPrice","volume"])
-                fig.update_traces(marker=dict(size=8), mode='lines+markers')
-                st.plotly_chart(fig)
+           
