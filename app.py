@@ -86,7 +86,7 @@ def fetch_earnings(ticker):
         return None
 
 @st.cache_data
-def fetch_sector_peers(ticker, max_peers=5):
+def fetch_sector_peers(ticker, max_peers=10):
     sector = largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values
     if len(sector)==0:
         return []
@@ -95,6 +95,7 @@ def fetch_sector_peers(ticker, max_peers=5):
     peers = peers.sort_values("MarketCap", ascending=False).head(max_peers)
     return peers["Ticker"].tolist()
 
+# --- Historical post-earnings move ---
 @st.cache_data
 def historical_earnings_move(ticker, last_n=10, days_post=1):
     try:
@@ -115,6 +116,61 @@ def historical_earnings_move(ticker, last_n=10, days_post=1):
     except:
         return None
 
+# --- Sector Average Post-Earnings Move ---
+@st.cache_data
+def sector_average_post_earnings(sector, last_n=10):
+    if sector is None:
+        return None
+    peers = largecap_df[largecap_df["Sector"]==sector]["Ticker"].tolist()
+    sector_moves = []
+    for ticker in peers:
+        move = historical_earnings_move(ticker, last_n=last_n)
+        if move is not None:
+            sector_moves.append(move)
+    if sector_moves:
+        return round(np.mean(sector_moves),2)
+    return None
+
+# --- Peer Correlation ---
+@st.cache_data
+def peer_correlation(ticker, max_peers=10, last_n=10):
+    peers = fetch_sector_peers(ticker, max_peers)
+    if not peers:
+        return None
+
+    # Fetch historical prices for ticker and peers
+    tk = yf.Ticker(ticker)
+    try:
+        earnings = tk.earnings_dates.tail(last_n)
+    except:
+        return None
+    ticker_moves = []
+    peers_moves_avg = []
+
+    for date in earnings.index:
+        date = pd.to_datetime(date)
+        pre = tk.history(start=date - pd.Timedelta(days=1), end=date)
+        post = tk.history(start=date, end=date + pd.Timedelta(days=1))
+        if pre.empty or post.empty:
+            continue
+        move = (post["Close"][-1] - pre["Close"][-1])/pre["Close"][-1]*100
+        ticker_moves.append(move)
+
+        # Fetch all peers at once
+        peers_data = yf.download(peers, start=date - pd.Timedelta(days=1), end=date + pd.Timedelta(days=1), group_by='ticker', progress=False)
+        peer_moves = []
+        for peer in peers:
+            if peer in peers_data:
+                pre_p = peers_data[peer]["Close"].iloc[0]
+                post_p = peers_data[peer]["Close"].iloc[-1]
+                move_p = (post_p - pre_p)/pre_p*100
+                peer_moves.append(move_p)
+        if peer_moves:
+            peers_moves_avg.append(np.mean(peer_moves))
+    if ticker_moves and peers_moves_avg:
+        return round(np.corrcoef(ticker_moves, peers_moves_avg)[0,1],2)
+    return None
+
 # --- Main Analysis ---
 results = []
 
@@ -130,6 +186,10 @@ if st.button("Run Analysis"):
             peers = fetch_sector_peers(ticker, peer_count)
             hist_move = historical_earnings_move(ticker, last_n=10)
             ratio = round(iv/hv,2) if hv and iv else None
+            sector_name = largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values[0] if len(largecap_df.loc[largecap_df["Ticker"]==ticker])>0 else None
+            sector_avg = sector_average_post_earnings(sector_name, last_n=10)
+            peer_corr = peer_correlation(ticker, max_peers=peer_count, last_n=10)
+
             results.append({
                 "Ticker": ticker,
                 "Earnings": earnings,
@@ -137,18 +197,18 @@ if st.button("Run Analysis"):
                 "HV (%)": hv,
                 "IV/HV Ratio": ratio,
                 "Historical Post-Earnings Move (%)": hist_move,
-                "Sector": largecap_df.loc[largecap_df["Ticker"]==ticker,"Sector"].values[0] if len(largecap_df.loc[largecap_df["Ticker"]==ticker])>0 else None,
+                "Sector": sector_name,
+                "Sector Avg Post-Earnings Move (%)": sector_avg,
+                "Peer Correlation": peer_corr,
                 "Sector Peers": ", ".join(peers)
             })
-            # Update progress
             progress_text.text(f"Processing {idx+1}/{len(tickers)}: {ticker}")
             progress_bar.progress((idx+1)/len(tickers))
     
-    # Convert results to DataFrame and sort by IV/HV ratio ascending
     df = pd.DataFrame(results)
     df.sort_values("IV/HV Ratio", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    
+
     st.success("✅ Analysis Complete!")
     st.dataframe(df)
 
@@ -156,7 +216,22 @@ if st.button("Run Analysis"):
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", csv, "earnings_analysis.csv", "text/csv")
 
-    # IV Curve
+    # --- Sector Performance Chart ---
+    st.subheader("📈 Sector Average Post-Earnings Move")
+    sector_df = df[["Ticker","Sector","Sector Avg Post-Earnings Move (%)"]].drop_duplicates()
+    fig_sector = px.bar(sector_df, x="Ticker", y="Sector Avg Post-Earnings Move (%)",
+                        color="Sector", labels={"Sector Avg Post-Earnings Move (%)":"Avg Post-Earnings Move (%)"})
+    st.plotly_chart(fig_sector)
+
+    # --- Peer Correlation Chart ---
+    st.subheader("🔗 Correlation to Sector Peers Post-Earnings")
+    corr_df = df[["Ticker","Peer Correlation"]].dropna()
+    fig_corr = px.bar(corr_df, x="Ticker", y="Peer Correlation",
+                      color="Peer Correlation", color_continuous_scale="Viridis",
+                      labels={"Peer Correlation":"Correlation"})
+    st.plotly_chart(fig_corr)
+
+    # --- IV Curve ---
     if show_iv_curve:
         for ticker in tickers:
             chains = fetch_iv_chain(ticker)
